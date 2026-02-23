@@ -1,7 +1,7 @@
 {
   "expo": {
     "name": "ShieldVPN",
-    "slug": "shield-vpn",
+    "slug": "shelksdf",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -37,6 +37,7 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
+      "./withVpnLib",
       "expo-router",
       [
         "expo-build-properties",
@@ -63,9 +64,9 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "c1b518fb-d4b1-4ebb-9b08-66f29cddf7e1"
+        "projectId": "4bcc87c5-f48d-4053-827d-8af1d1294d00"
       }
     },
-    "owner": "shield-vpn"
+    "owner": "jamal36973s-organization"
   }
 }

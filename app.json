@@ -37,7 +37,6 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
-      "./withVpnLib",
       "expo-router",
       [
         "expo-build-properties",

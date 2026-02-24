@@ -10,139 +10,184 @@ import React, {
   useState,
 } from "react";
 import { Alert } from "react-native";
-import { servers } from "../constants/Servers";
+import {
+  PROTON_SERVER_INFO,
+  PROTON_WIREGUARD_CONFIG,
+} from "../constants/Servers";
 import vpnService from "../services/VpnService";
 import {
-  getFavoriteServers,
   isOnboardingComplete as getOnboardingCompleteStorage,
-  getSelectedServer,
-  getVpnCredentials,
   getVpnSettings,
-  saveFavoriteServers,
-  saveSelectedServer,
   saveVpnSettings,
   setOnboardingComplete as setOnboardingCompleteStorage,
 } from "../storage/asyncStorage";
-import {
-  ConnectionStats,
-  ConnectionStatus,
-  Server,
-  VpnSettings,
-} from "../types";
+import { ConnectionStats, ConnectionStatus, VpnSettings } from "../types";
+
+// ─── Context Type ────────────────────────────────────────────────────
 
 interface VpnContextType {
   // State
   status: ConnectionStatus;
-  selectedServer: Server | null;
   connectionStats: ConnectionStats;
   errorMessage: string | null;
-  favoriteServers: string[];
-  isLoading: boolean; // <--- ADDED
-  isOnboardingComplete: boolean; // <--- ADDED
+  isLoading: boolean;
+  isOnboardingComplete: boolean;
+  settings: VpnSettings;
 
   // Actions
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
-  selectServer: (server: Server) => void;
-  toggleFavorite: (serverId: string) => void;
+  reconnect: () => Promise<void>;
   completeOnboarding: () => Promise<void>;
   clearError: () => void;
   updateSettings: (newValues: Partial<VpnSettings>) => Promise<void>;
-  settings: VpnSettings;
 }
 
+// ─── Defaults ────────────────────────────────────────────────────────
+
 const defaultStats: ConnectionStats = {
+  bytesIn: 0,
+  bytesOut: 0,
   downloadSpeed: 0,
   uploadSpeed: 0,
   dataUsed: 0,
   connectedTime: 0,
   ipAddress: "",
+  lastHandshake: undefined,
 };
+
+const defaultSettings: VpnSettings = {
+  killSwitch: false,
+  autoConnect: false,
+  splitTunneling: false,
+  protocol: "WireGuard",
+  darkMode: true,
+};
+
+// ─── Context ─────────────────────────────────────────────────────────
 
 const VpnContext = createContext<VpnContextType | undefined>(undefined);
 
+// ─── Provider ────────────────────────────────────────────────────────
+
 export function VpnProvider({ children }: { children: ReactNode }) {
+  // Connection state
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
-  const [selectedServer, setSelectedServer] = useState<Server | null>(null);
   const [connectionStats, setConnectionStats] =
     useState<ConnectionStats>(defaultStats);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [favoriteServers, setFavoriteServers] = useState<string[]>([]);
 
-  // App Loading States
+  // App state
   const [isLoading, setIsLoading] = useState(true);
   const [isOnboardingComplete, setIsOnboardingComplete] = useState(false);
+  const [settings, setSettings] = useState<VpnSettings>(defaultSettings);
 
+  // Refs for timers and tracking
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const connectedAtRef = useRef<number | null>(null);
-  const [settings, setSettings] = useState<VpnSettings>({
-    killSwitch: false,
-    autoConnect: false,
-    splitTunneling: false,
-    protocol: "OpenVPN",
-    darkMode: true,
+  const previousBytesRef = useRef<{ bytesIn: number; bytesOut: number }>({
+    bytesIn: 0,
+    bytesOut: 0,
   });
 
-  // Load saved data on mount
+  // ─── Initialization ─────────────────────────────────────────────
+
   useEffect(() => {
     loadSavedData();
     setupVpnListeners();
 
     return () => {
       vpnService.destroy();
-      if (timerRef.current) clearInterval(timerRef.current);
+      stopStatsTimer();
     };
   }, []);
 
   const loadSavedData = async () => {
     try {
-      // 1. Check Onboarding
+      // 1. Check onboarding
       const onboarded = await getOnboardingCompleteStorage();
       setIsOnboardingComplete(onboarded);
 
-      // 2. Load saved server
-      const savedServerId = await getSelectedServer();
-      if (savedServerId) {
-        const server = servers.find((s) => s.id === savedServerId);
-        if (server) setSelectedServer(server);
-        else setSelectedServer(servers[0]);
-      } else {
-        setSelectedServer(servers[0]);
-      }
-
-      // 3. Load favorites
-      const savedFavorites = await getFavoriteServers();
-      if (savedFavorites) {
-        setFavoriteServers(savedFavorites);
-      }
-
-      // LOAD SETTINGS
+      // 2. Load settings
       const savedSettings = await getVpnSettings();
-      setSettings(savedSettings);
+      setSettings({ ...defaultSettings, ...savedSettings });
     } catch (error) {
       console.error("Failed to load saved data:", error);
-      setSelectedServer(servers[0]);
     } finally {
-      // Done loading
       setIsLoading(false);
     }
   };
+
+  // ─── VPN Event Listeners ────────────────────────────────────────
 
   const setupVpnListeners = () => {
     vpnService.onStateChange((newStatus: ConnectionStatus) => {
       setStatus(newStatus);
 
-      if (newStatus === "connected") {
-        startStatsTimer();
-      } else if (newStatus === "disconnected" || newStatus === "error") {
-        stopStatsTimer();
-        setConnectionStats(defaultStats);
+      switch (newStatus) {
+        case "connected":
+          startStatsTimer();
+          break;
+        case "disconnected":
+          stopStatsTimer();
+          resetStats();
+          break;
+        case "error":
+          stopStatsTimer();
+          resetStats();
+          setErrorMessage("VPN connection encountered an error");
+          break;
+        case "reconnecting":
+          // Keep stats running during reconnection
+          break;
       }
+    });
+
+    // Listen for native stats updates
+    vpnService.onStatsUpdate((nativeStats) => {
+      setConnectionStats((prev) => {
+        const now = Date.now();
+        const elapsed = connectedAtRef.current
+          ? Math.floor((now - connectedAtRef.current) / 1000)
+          : 0;
+
+        // Calculate speeds from byte deltas (2-second interval)
+        const downloadSpeed = Math.max(
+          0,
+          (nativeStats.bytesIn - previousBytesRef.current.bytesIn) / 2,
+        );
+        const uploadSpeed = Math.max(
+          0,
+          (nativeStats.bytesOut - previousBytesRef.current.bytesOut) / 2,
+        );
+
+        previousBytesRef.current = {
+          bytesIn: nativeStats.bytesIn,
+          bytesOut: nativeStats.bytesOut,
+        };
+
+        return {
+          ...prev,
+          bytesIn: nativeStats.bytesIn,
+          bytesOut: nativeStats.bytesOut,
+          downloadSpeed,
+          uploadSpeed,
+          dataUsed: nativeStats.bytesIn + nativeStats.bytesOut,
+          connectedTime: elapsed,
+          lastHandshake: nativeStats.lastHandshake,
+          ipAddress: nativeStats.ipAddress || prev.ipAddress,
+        };
+      });
     });
   };
 
+  // ─── Stats Timer ────────────────────────────────────────────────
+
   const startStatsTimer = () => {
     connectedAtRef.current = Date.now();
+    previousBytesRef.current = { bytesIn: 0, bytesOut: 0 };
+
+    // Update connected time every second
     timerRef.current = setInterval(() => {
       if (connectedAtRef.current) {
         const elapsed = Math.floor(
@@ -151,10 +196,6 @@ export function VpnProvider({ children }: { children: ReactNode }) {
         setConnectionStats((prev) => ({
           ...prev,
           connectedTime: elapsed,
-          downloadSpeed: Math.random() * 50 + 10,
-          uploadSpeed: Math.random() * 20 + 5,
-          dataUsed: prev.dataUsed + Math.random() * 0.1,
-          ipAddress: selectedServer?.ip || "",
         }));
       }
     }, 1000);
@@ -168,36 +209,34 @@ export function VpnProvider({ children }: { children: ReactNode }) {
     connectedAtRef.current = null;
   };
 
-  const connect = useCallback(async () => {
-    if (!selectedServer) {
-      Alert.alert("Error", "Please select a server first");
-      return;
-    }
-    if (!selectedServer.ovpnConfig) {
-      Alert.alert("Error", "No VPN configuration available for this server");
-      return;
-    }
+  const resetStats = () => {
+    setConnectionStats(defaultStats);
+    previousBytesRef.current = { bytesIn: 0, bytesOut: 0 };
+  };
 
+  // ─── Actions ────────────────────────────────────────────────────
+
+  const connect = useCallback(async () => {
     try {
       setStatus("connecting");
       setErrorMessage(null);
-      const credentials = await getVpnCredentials();
-      await vpnService.connect(
-        selectedServer,
-        credentials?.username,
-        credentials?.password,
-      );
+
+      // Connect using WireGuard config
+      await vpnService.connect({
+        config: PROTON_WIREGUARD_CONFIG,
+        serverName: PROTON_SERVER_INFO.name,
+      });
     } catch (error: any) {
       console.error("Connection failed:", error);
       setStatus("error");
-      setErrorMessage(error.message || "Failed to connect to VPN");
+      const message = error.message || "Failed to connect to VPN";
+      setErrorMessage(message);
       Alert.alert(
         "Connection Failed",
-        error.message ||
-          "Unable to connect to the VPN server. Please try again.",
+        `Unable to connect to ${PROTON_SERVER_INFO.name}.\n\n${message}`,
       );
     }
-  }, [selectedServer]);
+  }, []);
 
   const disconnect = useCallback(async () => {
     try {
@@ -210,91 +249,77 @@ export function VpnProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const selectServer = useCallback(
-    (server: Server) => {
-      if (status === "connected") {
-        Alert.alert(
-          "Switch Server",
-          "You need to disconnect before switching servers. Disconnect now?",
-          [
-            { text: "Cancel", style: "cancel" },
-            {
-              text: "Disconnect",
-              onPress: async () => {
-                await disconnect();
-                setSelectedServer(server);
-                saveSelectedServer(server.id);
-              },
-            },
-          ],
-        );
-      } else {
-        setSelectedServer(server);
-        saveSelectedServer(server.id);
-      }
-    },
-    [status, disconnect],
-  );
-
-  const toggleFavorite = useCallback((serverId: string) => {
-    setFavoriteServers((prev) => {
-      const updated = prev.includes(serverId)
-        ? prev.filter((id) => id !== serverId)
-        : [...prev, serverId];
-
-      saveFavoriteServers(updated);
-      return updated;
-    });
+  const reconnect = useCallback(async () => {
+    try {
+      setStatus("reconnecting");
+      setErrorMessage(null);
+      await vpnService.reconnect();
+    } catch (error: any) {
+      console.error("Reconnect failed:", error);
+      setStatus("error");
+      setErrorMessage(error.message || "Failed to reconnect");
+      Alert.alert(
+        "Reconnection Failed",
+        error.message || "Unable to reconnect. Please try manually.",
+      );
+    }
   }, []);
 
   const completeOnboarding = useCallback(async () => {
     try {
       await setOnboardingCompleteStorage();
-      setIsOnboardingComplete(true); // Update local state immediately
+      setIsOnboardingComplete(true);
     } catch (error) {
-      console.error("Failed to set onboarding complete", error);
+      console.error("Failed to set onboarding complete:", error);
     }
   }, []);
 
   const clearError = useCallback(() => {
     setErrorMessage(null);
-  }, []);
-  // NEW FUNCTION
+    if (status === "error") {
+      setStatus("disconnected");
+    }
+  }, [status]);
+
   const updateSettings = useCallback(
     async (newValues: Partial<VpnSettings>) => {
       setSettings((prev) => {
         const updated = { ...prev, ...newValues };
-        saveVpnSettings(updated); // Persist to storage
+        saveVpnSettings(updated);
         return updated;
       });
     },
     [],
   );
 
+  // ─── Render ─────────────────────────────────────────────────────
+
   return (
     <VpnContext.Provider
       value={{
+        // State
         status,
-        selectedServer,
         connectionStats,
         errorMessage,
-        favoriteServers,
-        isLoading, // <--- Exported
-        isOnboardingComplete, // <--- Exported
+        isLoading,
+        isOnboardingComplete,
+        settings,
+
+        // Actions
         connect,
         disconnect,
-        selectServer,
-        toggleFavorite,
+        reconnect,
         completeOnboarding,
         clearError,
-        settings,
-        updateSettings, // <--- Exported
+        updateSettings,
       }}
     >
       {children}
     </VpnContext.Provider>
   );
 }
+
+// ─── Hook ──────────────────────────────────────────────────────────
 
 export function useVpn() {
   const context = useContext(VpnContext);
